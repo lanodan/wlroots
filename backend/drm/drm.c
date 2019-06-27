@@ -190,13 +190,6 @@ static bool init_planes(struct wlr_drm_backend *drm) {
 			goto error;
 		}
 
-		// We don't really care about overlay planes, as we don't support them
-		// yet.
-		if (type == DRM_PLANE_TYPE_OVERLAY) {
-			drmModeFreePlane(plane);
-			continue;
-		}
-
 		assert(drm->num_crtcs <= 32);
 		struct wlr_drm_crtc *crtc = NULL;
 		for (size_t j = 0; j < drm->num_crtcs ; j++) {
@@ -258,6 +251,7 @@ bool init_drm_resources(struct wlr_drm_backend *drm) {
 		struct wlr_drm_crtc *crtc = &drm->crtcs[i];
 		crtc->id = res->crtcs[i];
 		crtc->legacy_crtc = drmModeGetCrtc(drm->fd, crtc->id);
+		crtc->lessee_id = 0;
 		get_drm_crtc_props(drm->fd, crtc->id, &crtc->props);
 	}
 
@@ -770,6 +764,8 @@ static void attempt_enable_needs_modeset(struct wlr_drm_backend *drm) {
 
 bool drm_connector_set_mode(struct wlr_drm_connector *conn,
 		struct wlr_output_mode *wlr_mode) {
+	assert(conn->state != WLR_DRM_CONN_LEASED
+			&& "Use of leased connector is a programming error");
 	struct wlr_drm_backend *drm = conn->backend;
 
 	conn->desired_enabled = wlr_mode != NULL;
@@ -833,6 +829,8 @@ bool drm_connector_set_mode(struct wlr_drm_connector *conn,
 struct wlr_output_mode *wlr_drm_connector_add_mode(struct wlr_output *output,
 		const drmModeModeInfo *modeinfo) {
 	struct wlr_drm_connector *conn = get_drm_connector_from_output(output);
+	assert(conn->state != WLR_DRM_CONN_LEASED
+			&& "Use of leased connector is a programming error");
 
 	if (modeinfo->type != DRM_MODE_TYPE_USERDEF) {
 		return NULL;
@@ -870,6 +868,8 @@ static bool drm_connector_set_cursor(struct wlr_output *output,
 		enum wl_output_transform transform,
 		int32_t hotspot_x, int32_t hotspot_y, bool update_texture) {
 	struct wlr_drm_connector *conn = get_drm_connector_from_output(output);
+	assert(conn->state != WLR_DRM_CONN_LEASED
+			&& "Use of leased connector is a programming error");
 	struct wlr_drm_backend *drm = conn->backend;
 	struct wlr_drm_crtc *crtc = conn->crtc;
 
@@ -964,6 +964,8 @@ static bool drm_connector_set_cursor(struct wlr_output *output,
 static bool drm_connector_move_cursor(struct wlr_output *output,
 		int x, int y) {
 	struct wlr_drm_connector *conn = get_drm_connector_from_output(output);
+	assert(conn->state != WLR_DRM_CONN_LEASED
+			&& "Use of leased connector is a programming error");
 	if (!conn->crtc) {
 		return false;
 	}
@@ -1012,6 +1014,10 @@ static void dealloc_crtc(struct wlr_drm_connector *conn);
  */
 static void drm_connector_destroy_output(struct wlr_output *output) {
 	struct wlr_drm_connector *conn = get_drm_connector_from_output(output);
+	if (conn->state == WLR_DRM_CONN_LEASED) {
+		// TODO: Check that cleanup is trully unrequired when it's leased
+		return;
+	}
 
 	dealloc_crtc(conn);
 
@@ -1095,10 +1101,17 @@ static void realloc_crtcs(struct wlr_drm_backend *drm) {
 	uint32_t new_match[drm->num_crtcs];
 
 	for (size_t i = 0; i < drm->num_crtcs; ++i) {
-		previous_match[i] = UNMATCHED;
+		if (drm->crtcs[i].lessee_id != 0) {
+			/* Do not consider leased CRTCs */
+			previous_match[i] = SKIP;
+		} else {
+			previous_match[i] = UNMATCHED;
+		}
 	}
 
 	wlr_log(WLR_DEBUG, "State before reallocation:");
+	wlr_log(WLR_DEBUG, "noutputs: %zd; ncrtc: %zd",
+			num_outputs, drm->num_crtcs);
 	size_t i = 0;
 	struct wlr_drm_connector *conn;
 	wl_list_for_each(conn, &drm->outputs, link) {
@@ -1135,7 +1148,7 @@ static void realloc_crtcs(struct wlr_drm_backend *drm) {
 		connector_match[i] = -1;
 	}
 	for (size_t i = 0; i < drm->num_crtcs; ++i) {
-		if (new_match[i] != UNMATCHED) {
+		if (new_match[i] != UNMATCHED && new_match[i] != SKIP) {
 			connector_match[new_match[i]] = i;
 		}
 	}
@@ -1222,6 +1235,15 @@ static uint32_t get_possible_crtcs(int fd, drmModeRes *res,
 
 static void disconnect_drm_connector(struct wlr_drm_connector *conn);
 
+static void drm_conn_init_wlr_output(struct wlr_drm_backend *drm,
+		struct wlr_drm_connector *wlr_conn, drmModeConnector *drm_conn) {
+	wlr_output_init(&wlr_conn->output,
+			&drm->backend, &output_impl, drm->display);
+	snprintf(wlr_conn->output.name, sizeof(wlr_conn->output.name),
+		"%s-%"PRIu32, conn_get_name(drm_conn->connector_type),
+		drm_conn->connector_type_id);
+}
+
 void scan_drm_connectors(struct wlr_drm_backend *drm) {
 	/*
 	 * This GPU is not really a modesetting device.
@@ -1246,6 +1268,14 @@ void scan_drm_connectors(struct wlr_drm_backend *drm) {
 	memset(seen, false, sizeof(seen));
 	size_t new_outputs_len = 0;
 	struct wlr_drm_connector *new_outputs[res->count_connectors + 1];
+
+	drmModeLesseeListPtr lessees = drmModeListLessees(drm->fd);
+	if (lessees->count > 0) {
+		wlr_log(WLR_INFO, "With active leases:");
+		for (uint32_t i = 0; i < lessees->count; ++i) {
+			wlr_log(WLR_INFO, "%d", lessees->lessees[i]);
+		}
+	}
 
 	for (int i = 0; i < res->count_connectors; ++i) {
 		drmModeConnector *drm_conn = drmModeGetConnector(drm->fd,
@@ -1280,16 +1310,13 @@ void scan_drm_connectors(struct wlr_drm_backend *drm) {
 			wlr_conn->state = WLR_DRM_CONN_DISCONNECTED;
 			wlr_conn->id = drm_conn->connector_id;
 
-			snprintf(wlr_conn->name, sizeof(wlr_conn->name),
-				"%s-%"PRIu32, conn_get_name(drm_conn->connector_type),
-				drm_conn->connector_type_id);
-
 			if (curr_enc) {
 				wlr_conn->old_crtc = drmModeGetCrtc(drm->fd, curr_enc->crtc_id);
 			}
 
 			wl_list_insert(drm->outputs.prev, &wlr_conn->link);
-			wlr_log(WLR_INFO, "Found connector '%s'", wlr_conn->name);
+			wlr_log(WLR_INFO, "Found connector '%s' (%d)",
+					wlr_conn->name, drm_conn->connector_id);
 		} else {
 			seen[index] = true;
 		}
@@ -1323,6 +1350,33 @@ void scan_drm_connectors(struct wlr_drm_backend *drm) {
 			}
 		}
 
+		if (wlr_conn->state == WLR_DRM_CONN_LEASED) {
+			/* Was the lease terminated? */
+			bool found = false;
+			for (uint32_t n = 0; n < lessees->count; ++n) {
+				if (lessees->lessees[n] == wlr_conn->lessee_id) {
+					found = true;
+				}
+			}
+			if (!found) {
+				/* Yes, it was */
+				wlr_log(WLR_DEBUG, "DRM lease %d terminated by kernel",
+						wlr_conn->lessee_id);
+				wlr_conn->state = WLR_DRM_CONN_DISCONNECTED;
+				wlr_conn->lessee_id = 0;
+				for (size_t i = 0; i < drm->num_crtcs; ++i) {
+					if (drm->crtcs[i].lessee_id == wlr_conn->lessee_id) {
+						drm->crtcs[i].lessee_id = 0;
+					}
+				}
+				if (wlr_conn->lease_terminated_cb != NULL) {
+					wlr_conn->lease_terminated_cb(
+							wlr_conn, wlr_conn->lease_terminated_data);
+				}
+				drm_conn_init_wlr_output(drm, wlr_conn, drm_conn);
+			}
+		}
+
 		if (wlr_conn->state == WLR_DRM_CONN_DISCONNECTED &&
 				drm_conn->connection == DRM_MODE_CONNECTED) {
 			wlr_log(WLR_INFO, "'%s' connected", wlr_conn->name);
@@ -1346,6 +1400,7 @@ void scan_drm_connectors(struct wlr_drm_backend *drm) {
 			uint64_t non_desktop;
 			if (get_drm_prop(drm->fd, wlr_conn->id,
 						wlr_conn->props.non_desktop, &non_desktop)) {
+				wlr_log(WLR_INFO, "Non-desktop connector");
 				wlr_conn->output.non_desktop = non_desktop;
 			}
 
@@ -1552,7 +1607,7 @@ void restore_drm_outputs(struct wlr_drm_backend *drm) {
 
 	wl_list_for_each(conn, &drm->outputs, link) {
 		drmModeCrtc *crtc = conn->old_crtc;
-		if (!crtc) {
+		if (!crtc || conn->state == WLR_DRM_CONN_LEASED) {
 			continue;
 		}
 
@@ -1564,6 +1619,9 @@ void restore_drm_outputs(struct wlr_drm_backend *drm) {
 
 static void disconnect_drm_connector(struct wlr_drm_connector *conn) {
 	if (conn->state == WLR_DRM_CONN_DISCONNECTED) {
+		return;
+	}
+	if (conn->state == WLR_DRM_CONN_LEASED) {
 		return;
 	}
 
@@ -1580,4 +1638,74 @@ void destroy_drm_connector(struct wlr_drm_connector *conn) {
 	drmModeFreeCrtc(conn->old_crtc);
 	wl_list_remove(&conn->link);
 	free(conn);
+}
+
+int drm_create_lease(struct wlr_drm_backend *backend,
+		struct wlr_drm_connector **conns, int nconns, uint32_t *lessee_id,
+		void (*lease_terminated_cb)(struct wlr_drm_connector *, void *),
+		void *lease_terminated_data) {
+	int nobjects = 0;
+	for (int i = 0; i < nconns; ++i) {
+		struct wlr_drm_connector *conn = conns[i];
+		assert(conn->state != WLR_DRM_CONN_LEASED);
+		nobjects += 0
+			+ 1 /* connector */
+			+ 1 /* crtc */
+			+ 1 /* primary plane */
+			+ (conn->crtc->cursor != NULL ? 1 : 0); /* cursor plane */
+	}
+	if (nobjects <= 0) {
+		wlr_log(WLR_ERROR, "Attempted DRM lease with <= 0 objects");
+		return -1;
+	}
+	wlr_log(WLR_DEBUG, "Issuing DRM lease with the %d objects:", nobjects);
+	uint32_t objects[nobjects + 1];
+	for (int i = 0, j = 0; i < nconns; ++i) {
+		struct wlr_drm_connector *conn = conns[i];
+		objects[j++] = conn->id;
+		objects[j++] = conn->crtc->id;
+		objects[j++] = conn->crtc->primary->id;
+		wlr_log(WLR_DEBUG, "connector: %d crtc: %d primary plane: %d",
+				conn->id, conn->crtc->id, conn->crtc->primary->id);
+		if (conn->crtc->cursor) {
+			wlr_log(WLR_DEBUG, "cursor plane: %d", conn->crtc->cursor->id);
+			objects[j++] = conn->crtc->cursor->id;
+		}
+	}
+	int lease_fd = drmModeCreateLease(backend->fd,
+			objects, nobjects, 0, lessee_id);
+	if (lease_fd < 0) {
+		return lease_fd;
+	}
+	wlr_log(WLR_DEBUG, "Issued DRM lease %d", *lessee_id);
+	for (int i = 0; i < nconns; ++i) {
+		struct wlr_drm_connector *conn = conns[i];
+		conn->lessee_id = *lessee_id;
+		conn->crtc->lessee_id = *lessee_id;
+		conn->state = WLR_DRM_CONN_LEASED;
+		conn->lease_terminated_cb = lease_terminated_cb;
+		conn->lease_terminated_data = lease_terminated_data;
+		wlr_output_destroy(&conn->output);
+	}
+	return lease_fd;
+}
+
+int drm_terminate_lease(struct wlr_drm_backend *backend, uint32_t lessee_id) {
+	wlr_log(WLR_DEBUG, "Terminating DRM lease %d", lessee_id);
+	int r = drmModeRevokeLease(backend->fd, lessee_id);
+	struct wlr_drm_connector *conn;
+	wl_list_for_each(conn, &backend->outputs, link) {
+		if (conn->state == WLR_DRM_CONN_LEASED
+				&& conn->lessee_id == lessee_id) {
+			conn->state = WLR_DRM_CONN_DISCONNECTED;
+			conn->lessee_id = 0;
+		}
+	}
+	for (size_t i = 0; i < backend->num_crtcs; ++i) {
+		if (backend->crtcs[i].lessee_id == lessee_id) {
+			backend->crtcs[i].lessee_id = 0;
+		}
+	}
+	scan_drm_connectors(backend);
+	return r;
 }
